@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Deep Claw Analytics - Nostr Analytics for OpenClaw</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container {
+      max-width: 600px;
+      margin: 40px auto;
+      background: white;
+      border-radius: 12px;
+      padding: 40px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+    }
+    h1 { color: #333; margin-bottom: 10px; font-size: 32px; }
+    .tagline { color: #666; margin-bottom: 30px; font-size: 18px; }
+    .emoji { font-size: 48px; text-align: center; margin-bottom: 20px; }
+    
+    .features {
+      background: #f8f9fa;
+      padding: 20px;
+      border-radius: 8px;
+      margin-bottom: 30px;
+    }
+    .features h3 { color: #667eea; margin-bottom: 15px; }
+    .features ul { list-style: none; }
+    .features li { padding: 8px 0; padding-left: 25px; position: relative; }
+    .features li:before {
+      content: "⚡";
+      position: absolute;
+      left: 0;
+    }
+    
+    .form-group {
+      margin-bottom: 20px;
+    }
+    label {
+      display: block;
+      margin-bottom: 8px;
+      font-weight: 600;
+      color: #333;
+    }
+    input {
+      width: 100%;
+      padding: 12px;
+      border: 2px solid #e0e0e0;
+      border-radius: 6px;
+      font-size: 16px;
+      transition: border-color 0.2s;
+    }
+    input:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+    
+    button {
+      width: 100%;
+      padding: 14px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      border-radius: 6px;
+      font-size: 18px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.2s;
+    }
+    button:hover {
+      transform: translateY(-2px);
+    }
+    button:active {
+      transform: translateY(0);
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    
+    .result {
+      margin-top: 20px;
+      padding: 20px;
+      border-radius: 8px;
+      display: none;
+    }
+    .result.success {
+      background: #d4edda;
+      border: 1px solid #c3e6cb;
+      color: #155724;
+    }
+    .result.error {
+      background: #f8d7da;
+      border: 1px solid #f5c6cb;
+      color: #721c24;
+    }
+    .result h3 { margin-bottom: 10px; }
+    .result code {
+      display: block;
+      background: rgba(0,0,0,0.05);
+      padding: 10px;
+      border-radius: 4px;
+      margin-top: 10px;
+      font-size: 14px;
+      word-break: break-all;
+    }
+    
+    .helper-text {
+      font-size: 14px;
+      color: #666;
+      margin-top: 5px;
+    }
+    
+    footer {
+      text-align: center;
+      margin-top: 40px;
+      color: white;
+      font-size: 14px;
+    }
+    footer a { color: white; text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="emoji">🦞</div>
+    <h1>Deep Claw Analytics</h1>
+    <p class="tagline">Nostr analytics for your OpenClaw agent</p>
+    
+    <div class="features">
+      <h3>What you get:</h3>
+      <ul>
+        <li>Real-time webhooks (mentions, followers, zaps)</li>
+        <li>Engagement metrics & analytics</li>
+        <li>Your AI agent responds automatically</li>
+        <li>Track follower growth over time</li>
+        <li>REST API access</li>
+      </ul>
+    </div>
+    
+    <form id="signup-form">
+      <div class="form-group">
+        <label for="npub">Your Nostr npub</label>
+        <input 
+          type="text" 
+          id="npub" 
+          name="npub" 
+          placeholder="npub1..." 
+          required
+        >
+        <div class="helper-text">Your Nostr public key (npub format)</div>
+      </div>
+      
+      <div class="form-group">
+        <label for="email">Email (optional)</label>
+        <input 
+          type="email" 
+          id="email" 
+          name="email" 
+          placeholder="you@example.com"
+        >
+        <div class="helper-text">For important notifications only</div>
+      </div>
+      
+      <div class="form-group">
+        <label for="webhook_url">OpenClaw Webhook URL</label>
+        <input 
+          type="url" 
+          id="webhook_url" 
+          name="webhook_url" 
+          placeholder="https://your-gateway.com/webhooks/deep-claw" 
+          required
+        >
+        <div class="helper-text">Your OpenClaw gateway webhook endpoint</div>
+      </div>
+      
+      <button type="submit" id="submit-btn">Sign Up 🚀</button>
+    </form>
+    
+    <div class="result" id="result"></div>
+  </div>
+  
+  <footer>
+    Built with 🦞 by <a href="https://github.com/deepclaw" target="_blank">Deep Claw</a>
+    • <a href="https://docs.deepclaw.io" target="_blank">Docs</a>
+    • <a href="https://github.com/deepclaw/analytics" target="_blank">GitHub</a>
+  </footer>
+  
+  <script>
+    const form = document.getElementById('signup-form');
+    const submitBtn = document.getElementById('submit-btn');
+    const result = document.getElementById('result');
+    
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Creating account...';
+      result.style.display = 'none';
+      
+      const formData = {
+        npub: document.getElementById('npub').value.trim(),
+        email: document.getElementById('email').value.trim() || null,
+        webhook_url: document.getElementById('webhook_url').value.trim()
+      };
+      
+      try {
+        const response = await fetch('/auth/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(formData)
+        });
+        
+        const data = await response.json();
+        
+        if (response.ok) {
+          result.className = 'result success';
+          result.innerHTML = `
+            <h3>✅ Account created successfully!</h3>
+            <p><strong>Save these credentials securely:</strong></p>
+            <p>API Token:</p>
+            <code>${data.credentials.api_token}</code>
+            <p>Webhook Secret:</p>
+            <code>${data.credentials.webhook_secret}</code>
+            <p>Add these to your OpenClaw configuration and TOOLS.md file.</p>
+          `;
+        } else {
+          result.className = 'result error';
+          result.innerHTML = `
+            <h3>❌ ${data.error}</h3>
+            <p>${data.message}</p>
+          `;
+        }
+        
+        result.style.display = 'block';
+        
+      } catch (error) {
+        result.className = 'result error';
+        result.innerHTML = `
+          <h3>❌ Network error</h3>
+          <p>Failed to connect to server: ${error.message}</p>
+        `;
+        result.style.display = 'block';
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Sign Up 🚀';
+      }
+    });
+  </script>
+</body>
+</html>
