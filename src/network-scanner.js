@@ -4,6 +4,10 @@
  * to bootstrap timing analytics data
  */
 
+// WebSocket polyfill for Node.js environment
+const WebSocket = require('ws');
+global.WebSocket = WebSocket;
+
 const { SimplePool, nip19 } = require('nostr-tools');
 const db = require('./db');
 
