@@ -12,6 +12,7 @@ const config = require('./config');
 const db = require('./db');
 const auth = require('./auth');
 const timingAnalytics = require('./timing-analytics');
+const networkScanner = require('./network-scanner');
 
 const app = express();
 
@@ -521,6 +522,107 @@ app.post('/admin/aggregate-activity', auth.authenticate, async (req, res) => {
     res.status(500).json({
       error: 'Internal server error',
       message: 'Failed to aggregate activity'
+    });
+  }
+});
+
+/**
+ * Scan user's network to populate timing data
+ * POST /admin/scan-network
+ * 
+ * This fetches recent posts from accounts the user follows
+ * to bootstrap timing analytics without waiting for passive collection.
+ */
+app.post('/admin/scan-network', auth.authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userNpub = req.user.npub;
+    const period = req.body.period || '30d';
+    
+    // Validate period
+    const validPeriods = ['7d', '30d', '90d'];
+    if (!validPeriods.includes(period)) {
+      return res.status(400).json({
+        error: 'Invalid period',
+        message: `Period must be one of: ${validPeriods.join(', ')}`
+      });
+    }
+    
+    console.log(`[API] Starting network scan for user ${userId} (${userNpub})`);
+    
+    // Run the scan
+    const result = await networkScanner.scanUserNetwork(userId, userNpub, period);
+    
+    if (!result.success) {
+      return res.status(400).json({
+        error: 'Scan failed',
+        message: result.error,
+        ...result
+      });
+    }
+    
+    // Clear any cached insights so fresh data is used
+    await db.query(
+      `DELETE FROM insights WHERE user_id = $1`,
+      [userId]
+    );
+    
+    res.json({
+      success: true,
+      message: 'Network scan complete',
+      ...result
+    });
+    
+  } catch (error) {
+    console.error('Network scan error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to scan network: ' + error.message
+    });
+  }
+});
+
+/**
+ * Quick scan - get activity distribution without storing (faster)
+ * GET /metrics/timing/quick-scan?period=30d
+ * 
+ * For users who want instant results without account registration.
+ * Requires npub in query string.
+ */
+app.get('/metrics/timing/quick-scan', async (req, res) => {
+  try {
+    const npub = req.query.npub;
+    const period = req.query.period || '30d';
+    
+    if (!npub) {
+      return res.status(400).json({
+        error: 'Missing npub',
+        message: 'Provide npub query parameter'
+      });
+    }
+    
+    const validPeriods = ['7d', '30d'];
+    if (!validPeriods.includes(period)) {
+      return res.status(400).json({
+        error: 'Invalid period',
+        message: `Period must be one of: ${validPeriods.join(', ')}`
+      });
+    }
+    
+    console.log(`[API] Quick scan for ${npub} (${period})`);
+    
+    const result = await networkScanner.quickScanNetwork(npub, period);
+    
+    res.json({
+      ...result,
+      current_time_gmt: new Date().toISOString(),
+    });
+    
+  } catch (error) {
+    console.error('Quick scan error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to scan network: ' + error.message
     });
   }
 });
