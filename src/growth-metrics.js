@@ -27,35 +27,35 @@ async function getFollowSuggestions(req, res) {
       potential_follows AS (
         -- People who engage with me but I don't follow
         SELECT DISTINCT
-          e.event_data->>'pubkey' as npub,
-          e.event_data->>'author_name' as name,
-          e.event_data->>'bio' as bio,
-          (e.event_data->>'follower_count')::int as follower_count,
+          e.author_npub as npub,
+          e.author_name as name,
+          e.metadata->>'bio' as bio,
+          (e.metadata->>'follower_count')::int as follower_count,
           COUNT(*) as engagement_count,
           MAX(e.created_at) as last_engagement,
           'engaged_with_you' as source
         FROM events e
         WHERE e.user_id = $1
-          AND e.type IN ('reaction', 'reply', 'zap', 'repost')
-          AND e.event_data->>'pubkey' NOT IN (SELECT following_npub FROM my_following)
+          AND e.event_type IN ('like', 'reply', 'zap', 'repost')
+          AND e.author_npub NOT IN (SELECT following_npub FROM my_following)
           AND e.created_at >= NOW() - INTERVAL '30 days'
-        GROUP BY npub, name, bio, follower_count
+        GROUP BY e.author_npub, e.author_name, e.metadata->>'bio', e.metadata->>'follower_count'
         
         UNION ALL
         
         -- Followers I don't follow back
         SELECT DISTINCT
-          e.event_data->>'pubkey' as npub,
-          e.event_data->>'author_name' as name,
-          e.event_data->>'bio' as bio,
-          (e.event_data->>'follower_count')::int as follower_count,
+          e.author_npub as npub,
+          e.author_name as name,
+          e.metadata->>'bio' as bio,
+          (e.metadata->>'follower_count')::int as follower_count,
           1 as engagement_count,
           e.created_at as last_engagement,
           'follower_not_followed' as source
         FROM events e
         WHERE e.user_id = $1
-          AND e.type = 'follow'
-          AND e.event_data->>'pubkey' NOT IN (SELECT following_npub FROM my_following)
+          AND e.event_type = 'follow'
+          AND e.author_npub NOT IN (SELECT following_npub FROM my_following)
           AND e.created_at >= NOW() - INTERVAL '90 days'
       ),
       scored AS (
@@ -192,22 +192,22 @@ async function acknowledgeEvents(req, res) {
       });
     }
     
-    // Update events to acknowledged
+    // Update events to processed (using existing schema)
     const result = await db.query(`
       UPDATE events
-      SET acknowledged = true
+      SET processed = true
       WHERE user_id = $1
         AND id = ANY($2::int[])
-        AND acknowledged = false
+        AND processed = false
       RETURNING id
     `, [userId, eventIds]);
     
-    // Get remaining unacknowledged count
+    // Get remaining unprocessed count
     const remainingResult = await db.query(`
       SELECT COUNT(*) as remaining
       FROM events
       WHERE user_id = $1
-        AND acknowledged = false
+        AND processed = false
     `, [userId]);
     
     res.json({
@@ -260,7 +260,7 @@ async function getGrowthMetrics(req, res) {
           COUNT(*) as new_followers
         FROM events
         WHERE user_id = $1
-          AND type = 'follow'
+          AND event_type = 'follow'
           AND created_at >= NOW() - INTERVAL '${days} days'
         GROUP BY date
       ),
@@ -276,12 +276,12 @@ async function getGrowthMetrics(req, res) {
       daily_engagement AS (
         SELECT 
           DATE_TRUNC('${dateTrunc}', created_at)::date as date,
-          COUNT(CASE WHEN type = 'reaction' THEN 1 END) as reactions,
-          COUNT(CASE WHEN type = 'reply' THEN 1 END) as replies,
-          SUM(CASE WHEN type = 'zap' THEN (event_data->>'amount_sats')::int ELSE 0 END) as zaps_sats
+          COUNT(CASE WHEN event_type = 'like' THEN 1 END) as reactions,
+          COUNT(CASE WHEN event_type = 'reply' THEN 1 END) as replies,
+          SUM(CASE WHEN event_type = 'zap' THEN (metadata->>'amount_sats')::int ELSE 0 END) as zaps_sats
         FROM events
         WHERE user_id = $1
-          AND type IN ('reaction', 'reply', 'zap')
+          AND event_type IN ('like', 'reply', 'zap')
           AND created_at >= NOW() - INTERVAL '${days} days'
         GROUP BY date
       )

@@ -13,27 +13,28 @@ async function getActivity(req, res) {
   try {
     const userId = req.user.id;
     const since = req.query.since || new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const types = req.query.types ? req.query.types.split(',') : ['reaction', 'reply', 'mention', 'zap', 'follow'];
+    const types = req.query.types ? req.query.types.split(',') : ['like', 'reply', 'mention', 'zap', 'follow', 'repost'];
     
     // Query events table for activity since timestamp
+    // Using existing schema: event_type, processed, author_npub, etc.
     const query = `
       SELECT 
         e.id,
-        e.type,
-        e.event_data->>'id' as post_id,
-        e.event_data->>'content' as post_content,
-        e.event_data->>'pubkey' as from_user,
-        e.event_data->>'author_name' as from_user_name,
-        e.event_data->>'emoji' as emoji,
-        e.event_data->>'reply_content' as reply_content,
-        e.event_data->>'amount_sats' as amount_sats,
-        e.event_data->>'message' as message,
+        e.event_type as type,
+        e.event_id as post_id,
+        e.content as post_content,
+        e.author_npub as from_user,
+        e.author_name as from_user_name,
+        e.metadata->>'emoji' as emoji,
+        e.metadata->>'reply_content' as reply_content,
+        e.metadata->>'amount_sats' as amount_sats,
+        e.metadata->>'message' as message,
         e.created_at as timestamp
       FROM events e
       WHERE e.user_id = $1
         AND e.created_at >= $2
-        AND e.type = ANY($3)
-        AND e.acknowledged = false
+        AND e.event_type = ANY($3)
+        AND e.processed = false
       ORDER BY e.created_at DESC
     `;
     
@@ -50,7 +51,7 @@ async function getActivity(req, res) {
       };
       
       // Add type-specific fields
-      if (row.type === 'reaction') {
+      if (row.type === 'like') {
         event.postContent = row.post_content;
         event.emoji = row.emoji;
       } else if (row.type === 'reply') {
@@ -92,6 +93,7 @@ async function getPostsPerformance(req, res) {
     const include = req.query.include ? req.query.include.split(',') : ['metrics', 'top_engagers'];
     
     // Query for user's recent posts with aggregated metrics
+    // Using existing schema: event_type, metadata, etc.
     const query = `
       WITH post_metrics AS (
         SELECT 
@@ -99,14 +101,14 @@ async function getPostsPerformance(req, res) {
           p.content,
           p.posted_at as timestamp,
           p.image_url,
-          COUNT(DISTINCT CASE WHEN e.type = 'reaction' THEN e.id END) as reactions,
-          COUNT(DISTINCT CASE WHEN e.type = 'reply' THEN e.id END) as replies,
-          COUNT(DISTINCT CASE WHEN e.type = 'repost' THEN e.id END) as reposts,
-          COUNT(DISTINCT CASE WHEN e.type = 'zap' THEN e.id END) as zap_count,
-          COALESCE(SUM(CASE WHEN e.type = 'zap' THEN (e.event_data->>'amount_sats')::int ELSE 0 END), 0) as total_sats,
+          COUNT(DISTINCT CASE WHEN e.event_type = 'like' THEN e.id END) as reactions,
+          COUNT(DISTINCT CASE WHEN e.event_type = 'reply' THEN e.id END) as replies,
+          COUNT(DISTINCT CASE WHEN e.event_type = 'repost' THEN e.id END) as reposts,
+          COUNT(DISTINCT CASE WHEN e.event_type = 'zap' THEN e.id END) as zap_count,
+          COALESCE(SUM(CASE WHEN e.event_type = 'zap' THEN (e.metadata->>'amount_sats')::int ELSE 0 END), 0) as total_sats,
           p.impressions
         FROM posts p
-        LEFT JOIN events e ON e.event_data->>'post_id' = p.note_id AND e.user_id = p.user_id
+        LEFT JOIN events e ON e.event_id = p.note_id AND e.user_id = p.user_id
         WHERE p.user_id = $1
         GROUP BY p.note_id, p.content, p.posted_at, p.image_url, p.impressions
         ORDER BY p.posted_at DESC
@@ -150,17 +152,17 @@ async function getPostsPerformance(req, res) {
         // Get top engagers for this post
         const engagersQuery = `
           SELECT 
-            e.event_data->>'pubkey' as npub,
-            e.event_data->>'author_name' as name,
-            e.type as action,
+            e.author_npub as npub,
+            e.author_name as name,
+            e.event_type as action,
             CASE 
-              WHEN e.type = 'zap' THEN (e.event_data->>'amount_sats')::int
+              WHEN e.event_type = 'zap' THEN (e.metadata->>'amount_sats')::int
               ELSE NULL 
             END as value
           FROM events e
           WHERE e.user_id = $1 
-            AND e.event_data->>'post_id' = $2
-            AND e.type IN ('reaction', 'reply', 'zap', 'repost')
+            AND e.event_id = $2
+            AND e.event_type IN ('like', 'reply', 'zap', 'repost')
           ORDER BY e.created_at DESC
           LIMIT 5
         `;
@@ -210,20 +212,20 @@ async function getTopEngagers(req, res) {
     const query = `
       WITH engager_stats AS (
         SELECT 
-          e.event_data->>'pubkey' as npub,
-          e.event_data->>'author_name' as name,
-          e.event_data->>'follower_count' as follower_count,
+          e.author_npub as npub,
+          e.author_name as name,
+          e.metadata->>'follower_count' as follower_count,
           COUNT(*) as total_interactions,
-          COUNT(CASE WHEN e.type = 'zap' THEN 1 END) as zaps,
-          COUNT(CASE WHEN e.type = 'reply' THEN 1 END) as replies,
-          COUNT(CASE WHEN e.type = 'reaction' THEN 1 END) as reactions,
-          COALESCE(SUM(CASE WHEN e.type = 'zap' THEN (e.event_data->>'amount_sats')::int ELSE 0 END), 0) as total_sats_zapped,
+          COUNT(CASE WHEN e.event_type = 'zap' THEN 1 END) as zaps,
+          COUNT(CASE WHEN e.event_type = 'reply' THEN 1 END) as replies,
+          COUNT(CASE WHEN e.event_type = 'like' THEN 1 END) as reactions,
+          COALESCE(SUM(CASE WHEN e.event_type = 'zap' THEN (e.metadata->>'amount_sats')::int ELSE 0 END), 0) as total_sats_zapped,
           MAX(e.created_at) as last_interaction
         FROM events e
         WHERE e.user_id = $1
           AND e.created_at >= $2
-          AND e.type IN ('zap', 'reply', 'reaction', 'repost')
-        GROUP BY npub, name, follower_count
+          AND e.event_type IN ('zap', 'reply', 'like', 'repost')
+        GROUP BY e.author_npub, e.author_name, e.metadata->>'follower_count'
         HAVING COUNT(*) >= $3
         ORDER BY total_interactions DESC, total_sats_zapped DESC
         LIMIT 50
@@ -272,21 +274,21 @@ async function getShouldEngage(req, res) {
     const userId = req.user.id;
     const limit = parseInt(req.query.limit) || 10;
     
-    // Get recent unacknowledged replies and mentions
+    // Get recent unprocessed replies and mentions
     const repliesQuery = `
       SELECT 
         e.id,
-        e.event_data->>'pubkey' as npub,
-        e.event_data->>'author_name' as name,
-        e.event_data->>'post_id' as post_id,
-        e.event_data->>'reply_content' as reply_content,
-        e.event_data->>'reply_id' as reply_id,
-        e.event_data->>'follower_count' as follower_count,
+        e.author_npub as npub,
+        e.author_name as name,
+        e.event_id as post_id,
+        e.content as reply_content,
+        e.metadata->>'reply_id' as reply_id,
+        e.metadata->>'follower_count' as follower_count,
         e.created_at
       FROM events e
       WHERE e.user_id = $1
-        AND e.type = 'reply'
-        AND e.acknowledged = false
+        AND e.event_type = 'reply'
+        AND e.processed = false
         AND e.created_at >= NOW() - INTERVAL '7 days'
       ORDER BY e.created_at DESC
       LIMIT $2
@@ -296,15 +298,15 @@ async function getShouldEngage(req, res) {
     const followersQuery = `
       SELECT 
         e.id,
-        e.event_data->>'pubkey' as npub,
-        e.event_data->>'author_name' as name,
-        e.event_data->>'follower_count' as follower_count,
-        e.event_data->>'bio' as bio,
+        e.author_npub as npub,
+        e.author_name as name,
+        e.metadata->>'follower_count' as follower_count,
+        e.metadata->>'bio' as bio,
         e.created_at
       FROM events e
       WHERE e.user_id = $1
-        AND e.type = 'follow'
-        AND e.acknowledged = false
+        AND e.event_type = 'follow'
+        AND e.processed = false
         AND e.created_at >= NOW() - INTERVAL '7 days'
       ORDER BY e.created_at DESC
       LIMIT $2
