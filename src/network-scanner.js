@@ -1,6 +1,6 @@
 /**
  * Network Scanner
- * Fetches historical activity from a user's network (following) from Nostr relays
+ * Fetches historical activity from a user's network (following AND followers) from Nostr relays
  * to bootstrap timing analytics data
  */
 
@@ -18,6 +18,12 @@ const DEFAULT_RELAYS = [
   'wss://relay.nostr.band',
   'wss://nostr.wine',
   'wss://relay.snort.social',
+  'wss://purplepag.es',
+];
+
+// Relays that index follower data (can query for who follows a pubkey)
+const INDEXING_RELAYS = [
+  'wss://relay.nostr.band',
   'wss://purplepag.es',
 ];
 
@@ -49,6 +55,40 @@ async function getFollowingList(pubkey, relays = DEFAULT_RELAYS) {
     return following;
   } finally {
     pool.close(relays);
+  }
+}
+
+/**
+ * Get a user's followers list from Nostr
+ * This queries indexing relays for contact lists that include the target pubkey
+ * @param {string} pubkey - User's hex pubkey
+ * @param {number} limit - Max followers to fetch (default 500)
+ * @returns {Promise<string[]>} - List of follower pubkeys
+ */
+async function getFollowersList(pubkey, limit = 500) {
+  const pool = new SimplePool();
+  
+  try {
+    console.log(`[Scanner] Fetching followers for ${pubkey.slice(0, 8)}...`);
+    
+    // Query indexing relays for kind 3 events that tag this pubkey
+    // This finds all contact lists where someone follows this user
+    const events = await pool.querySync(INDEXING_RELAYS, {
+      kinds: [3],
+      '#p': [pubkey],
+      limit: limit,
+    });
+    
+    // Extract unique author pubkeys (these are the followers)
+    const followers = [...new Set(events.map(event => event.pubkey))];
+    
+    console.log(`[Scanner] Found ${followers.length} followers`);
+    return followers;
+  } catch (err) {
+    console.error(`[Scanner] Error fetching followers:`, err.message);
+    return [];
+  } finally {
+    pool.close(INDEXING_RELAYS);
   }
 }
 
@@ -231,30 +271,11 @@ async function aggregatePostActivity(userId) {
 }
 
 /**
- * Quick scan - just get activity distribution without storing individual posts
- * Faster for immediate results
- * @param {string} userPubkey - User's hex pubkey or npub
- * @param {string} period - '7d' | '30d'
- * @returns {Promise<Object>} - Hourly distribution
+ * Calculate hourly distribution and zone of max participation from posts
+ * @param {Array} posts - Array of post events
+ * @returns {Object} - Distribution data
  */
-async function quickScanNetwork(userPubkey, period = '30d') {
-  const pubkey = npubToPubkey(userPubkey);
-  
-  const periodDays = { '7d': 7, '30d': 30 };
-  const days = periodDays[period] || 30;
-  const since = Math.floor(Date.now() / 1000) - (days * 24 * 60 * 60);
-  
-  // Get following
-  const following = await getFollowingList(pubkey);
-  
-  if (following.length === 0) {
-    return { error: 'No following list found', hourly_distribution: [] };
-  }
-  
-  // Fetch posts
-  const posts = await fetchNetworkPosts(following.slice(0, 200), since); // Limit to 200 accounts for speed
-  
-  // Calculate hourly distribution
+function calculateDistribution(posts) {
   const hourlyCount = new Array(24).fill(0);
   for (const post of posts) {
     const hour = new Date(post.created_at * 1000).getUTCHours();
@@ -296,18 +317,125 @@ async function quickScanNetwork(userPubkey, period = '30d') {
     }
   }
   
-  return {
-    following_count: following.length,
-    posts_analyzed: posts.length,
+  return { hourlyDistribution, peakHours, bestZone };
+}
+
+/**
+ * Quick scan - get activity distribution without storing individual posts
+ * Faster for immediate results
+ * @param {string} userPubkey - User's hex pubkey or npub
+ * @param {string} period - '7d' | '30d'
+ * @param {string} mode - 'following' | 'followers' | 'both'
+ * @returns {Promise<Object>} - Hourly distribution by mode
+ */
+async function quickScanNetwork(userPubkey, period = '30d', mode = 'both') {
+  const pubkey = npubToPubkey(userPubkey);
+  
+  const periodDays = { '7d': 7, '30d': 30, '90d': 90 };
+  const days = periodDays[period] || 30;
+  const since = Math.floor(Date.now() / 1000) - (days * 24 * 60 * 60);
+  
+  const result = {
+    pubkey: pubkey.slice(0, 8) + '...',
     period,
-    hourly_distribution: hourlyDistribution,
-    peak_hours: peakHours,
-    zone_of_max_participation: bestZone,
+    mode,
+    current_time_gmt: new Date().toISOString(),
   };
+  
+  // Fetch following data
+  if (mode === 'following' || mode === 'both') {
+    console.log(`[Scanner] Scanning following list...`);
+    const following = await getFollowingList(pubkey);
+    
+    if (following.length > 0) {
+      const posts = await fetchNetworkPosts(following.slice(0, 200), since);
+      const { hourlyDistribution, peakHours, bestZone } = calculateDistribution(posts);
+      
+      result.following = {
+        count: following.length,
+        posts_analyzed: posts.length,
+        hourly_distribution: hourlyDistribution,
+        peak_hours: peakHours,
+        zone_of_max_participation: bestZone,
+      };
+    } else {
+      result.following = { count: 0, posts_analyzed: 0, error: 'No following list found' };
+    }
+  }
+  
+  // Fetch followers data
+  if (mode === 'followers' || mode === 'both') {
+    console.log(`[Scanner] Scanning followers list...`);
+    const followers = await getFollowersList(pubkey, 300); // Limit for speed
+    
+    if (followers.length > 0) {
+      const posts = await fetchNetworkPosts(followers.slice(0, 200), since);
+      const { hourlyDistribution, peakHours, bestZone } = calculateDistribution(posts);
+      
+      result.followers = {
+        count: followers.length,
+        posts_analyzed: posts.length,
+        hourly_distribution: hourlyDistribution,
+        peak_hours: peakHours,
+        zone_of_max_participation: bestZone,
+      };
+    } else {
+      result.followers = { count: 0, posts_analyzed: 0, error: 'No followers found' };
+    }
+  }
+  
+  // Calculate combined "both" distribution if requested
+  if (mode === 'both' && result.following?.hourly_distribution && result.followers?.hourly_distribution) {
+    const combinedHourly = result.following.hourly_distribution.map((h, i) => ({
+      hour_gmt: h.hour_gmt,
+      activity_count: h.activity_count + (result.followers.hourly_distribution[i]?.activity_count || 0),
+    }));
+    
+    // Recalculate peak hours and zone for combined
+    const sorted = [...combinedHourly].sort((a, b) => b.activity_count - a.activity_count);
+    const combinedPeakHours = sorted.slice(0, 3).map(h => h.hour_gmt);
+    
+    const totalPosts = (result.following?.posts_analyzed || 0) + (result.followers?.posts_analyzed || 0);
+    const hourlyCount = combinedHourly.map(h => h.activity_count);
+    
+    let bestZone = null;
+    let maxActivity = 0;
+    for (let windowSize = 3; windowSize <= 6; windowSize++) {
+      for (let start = 0; start < 24; start++) {
+        let activity = 0;
+        for (let i = 0; i < windowSize; i++) {
+          activity += hourlyCount[(start + i) % 24];
+        }
+        if (activity > maxActivity) {
+          maxActivity = activity;
+          bestZone = {
+            start_hour_gmt: start,
+            end_hour_gmt: (start + windowSize - 1) % 24,
+            window_size: windowSize,
+            total_activity: activity,
+            percentage_of_total: totalPosts > 0 
+              ? parseFloat(((activity / totalPosts) * 100).toFixed(1))
+              : 0,
+          };
+        }
+      }
+    }
+    
+    result.combined = {
+      total_network: (result.following?.count || 0) + (result.followers?.count || 0),
+      posts_analyzed: totalPosts,
+      hourly_distribution: combinedHourly,
+      peak_hours: combinedPeakHours,
+      zone_of_max_participation: bestZone,
+    };
+  }
+  
+  return result;
 }
 
 module.exports = {
   getFollowingList,
+  getFollowersList,
   fetchNetworkPosts,
   scanUserNetwork,
   aggregatePostActivity,

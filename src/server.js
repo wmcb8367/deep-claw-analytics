@@ -584,15 +584,21 @@ app.post('/admin/scan-network', auth.authenticate, async (req, res) => {
 
 /**
  * Quick scan - get activity distribution without storing (faster)
- * GET /metrics/timing/quick-scan?period=30d
+ * GET /metrics/timing/quick-scan?npub=...&period=30d&mode=both
  * 
  * For users who want instant results without account registration.
  * Requires npub in query string.
+ * 
+ * Mode options:
+ * - 'following' - Only scan accounts the user follows
+ * - 'followers' - Only scan accounts that follow the user
+ * - 'both' (default) - Scan both and provide combined data
  */
 app.get('/metrics/timing/quick-scan', async (req, res) => {
   try {
     const npub = req.query.npub;
     const period = req.query.period || '30d';
+    const mode = req.query.mode || 'both';
     
     if (!npub) {
       return res.status(400).json({
@@ -601,7 +607,7 @@ app.get('/metrics/timing/quick-scan', async (req, res) => {
       });
     }
     
-    const validPeriods = ['7d', '30d'];
+    const validPeriods = ['7d', '30d', '90d'];
     if (!validPeriods.includes(period)) {
       return res.status(400).json({
         error: 'Invalid period',
@@ -609,14 +615,19 @@ app.get('/metrics/timing/quick-scan', async (req, res) => {
       });
     }
     
-    console.log(`[API] Quick scan for ${npub} (${period})`);
+    const validModes = ['following', 'followers', 'both'];
+    if (!validModes.includes(mode)) {
+      return res.status(400).json({
+        error: 'Invalid mode',
+        message: `Mode must be one of: ${validModes.join(', ')}`
+      });
+    }
     
-    const result = await networkScanner.quickScanNetwork(npub, period);
+    console.log(`[API] Quick scan for ${npub} (${period}, mode=${mode})`);
     
-    res.json({
-      ...result,
-      current_time_gmt: new Date().toISOString(),
-    });
+    const result = await networkScanner.quickScanNetwork(npub, period, mode);
+    
+    res.json(result);
     
   } catch (error) {
     console.error('Quick scan error:', error);
