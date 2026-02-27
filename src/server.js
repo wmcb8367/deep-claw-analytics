@@ -15,6 +15,7 @@ const timingAnalytics = require('./timing-analytics');
 const networkScanner = require('./network-scanner');
 const agentApi = require('./agent-api');
 const hashtagAnalytics = require('./hashtag-analytics');
+const growthMetrics = require('./growth-metrics');
 
 const app = express();
 
@@ -696,6 +697,28 @@ app.get('/hashtags/trending', auth.authenticate, hashtagAnalytics.getTrendingHas
  * Get personalized hashtag recommendations
  */
 app.get('/hashtags/recommendations', auth.authenticate, hashtagAnalytics.getHashtagRecommendations);
+
+// ========================================
+// NETWORK & GROWTH ENDPOINTS
+// ========================================
+
+/**
+ * GET /network/follow-suggestions
+ * Get smart recommendations for who to follow
+ */
+app.get('/network/follow-suggestions', auth.authenticate, growthMetrics.getFollowSuggestions);
+
+/**
+ * POST /events/acknowledge
+ * Mark events as seen/processed
+ */
+app.post('/events/acknowledge', auth.authenticate, growthMetrics.acknowledgeEvents);
+
+/**
+ * GET /metrics/growth
+ * Track account growth over time
+ */
+app.get('/metrics/growth', auth.authenticate, growthMetrics.getGrowthMetrics);
 
 // ========================================
 // Error handler
