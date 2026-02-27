@@ -14,6 +14,7 @@ const auth = require('./auth');
 const timingAnalytics = require('./timing-analytics');
 const networkScanner = require('./network-scanner');
 const agentApi = require('./agent-api');
+const hashtagAnalytics = require('./hashtag-analytics');
 
 const app = express();
 
@@ -673,6 +674,28 @@ app.get('/insights/should-engage', auth.authenticate, agentApi.getShouldEngage);
  * When and what to post for optimal engagement
  */
 app.get('/insights/posting-strategy', auth.authenticate, agentApi.getPostingStrategy);
+
+// ========================================
+// HASHTAG ANALYTICS ENDPOINTS
+// ========================================
+
+/**
+ * GET /hashtags/personal
+ * Analyze user's hashtag usage and performance
+ */
+app.get('/hashtags/personal', auth.authenticate, hashtagAnalytics.getPersonalHashtags);
+
+/**
+ * GET /hashtags/trending
+ * Get trending hashtags on Nostr
+ */
+app.get('/hashtags/trending', auth.authenticate, hashtagAnalytics.getTrendingHashtags);
+
+/**
+ * GET /hashtags/recommendations
+ * Get personalized hashtag recommendations
+ */
+app.get('/hashtags/recommendations', auth.authenticate, hashtagAnalytics.getHashtagRecommendations);
 
 // ========================================
 // Error handler
