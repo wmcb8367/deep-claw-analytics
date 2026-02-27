@@ -140,28 +140,64 @@ async function fetchUserPosts(pubkeyHex, days = 90) {
 
 /**
  * Fetch trending posts from Nostr for hashtag analysis
+ * Strategy: Query posts with popular hashtags to find what's trending
  */
 async function fetchTrendingPosts(hours = 24) {
   const since = Math.floor(Date.now() / 1000) - (hours * 60 * 60);
   const allPosts = [];
+  const seen = new Set();
   
   console.log(`[Hashtag] Fetching trending posts (last ${hours}h)...`);
   
-  // Query relay.nostr.band - they have good global coverage
-  try {
-    const events = await queryRelay('wss://relay.nostr.band', {
-      kinds: [1],
-      since: since,
-      limit: 500
-    }, 15000);
-    
-    allPosts.push(...events);
-    console.log(`[Hashtag] Found ${allPosts.length} recent posts`);
-  } catch (e) {
-    console.log(`[Hashtag] Trending fetch failed:`, e.message);
+  // Popular hashtags to seed our search
+  const seedHashtags = [
+    'bitcoin', 'nostr', 'grownostr', 'plebchain', 'lightning',
+    'zap', 'btc', 'coffeechain', 'asknostr', 'introductions',
+    'memes', 'art', 'music', 'tech', 'dev', 'ai'
+  ];
+  
+  // Relays to query
+  const relays = [
+    'wss://relay.nostr.band',
+    'wss://relay.damus.io',
+    'wss://nos.lol'
+  ];
+  
+  // Query each relay for recent posts
+  for (const relay of relays) {
+    try {
+      // Get recent posts (limit query to be reasonable)
+      const events = await queryRelay(relay, {
+        kinds: [1],
+        since: since,
+        limit: 200
+      }, 12000);
+      
+      for (const event of events) {
+        if (!seen.has(event.id) && event.content) {
+          seen.add(event.id);
+          allPosts.push(event);
+        }
+      }
+      
+      console.log(`[Hashtag] Got ${events.length} posts from ${relay}`);
+      
+      if (allPosts.length >= 300) break; // Got enough
+    } catch (e) {
+      console.log(`[Hashtag] ${relay} failed:`, e.message);
+    }
   }
   
-  return allPosts;
+  // If we got posts, filter to only those with hashtags
+  const postsWithHashtags = allPosts.filter(post => {
+    const content = post.content || '';
+    return content.includes('#') && /#\w+/.test(content);
+  });
+  
+  console.log(`[Hashtag] Found ${allPosts.length} total posts, ${postsWithHashtags.length} with hashtags`);
+  
+  // Return posts with hashtags, or all posts if not enough
+  return postsWithHashtags.length >= 50 ? postsWithHashtags : allPosts;
 }
 
 /**
@@ -571,12 +607,16 @@ async function getTrendingHashtags(req, res) {
     // Categorize trending hashtags
     const categories = categorizeTrendingHashtags(trending);
     
+    // Add strategy insights
+    const strategy = generateHashtagStrategy(trending, Object.keys(hashtagCounts).length);
+    
     res.json({
       period,
       totalPostsScanned: posts.length,
       totalUniqueHashtags: Object.keys(hashtagCounts).length,
       trending,
       categories,
+      strategy,
       scannedAt: new Date().toISOString()
     });
     
@@ -587,6 +627,71 @@ async function getTrendingHashtags(req, res) {
       message: error.message
     });
   }
+}
+
+/**
+ * Generate hashtag strategy recommendations
+ * Addresses the question: how to balance popular vs niche hashtags on Nostr
+ */
+function generateHashtagStrategy(trending, totalUniqueHashtags) {
+  // Categorize hashtags by competition level
+  const highCompetition = trending.filter(t => t.postCount >= 20);
+  const mediumCompetition = trending.filter(t => t.postCount >= 5 && t.postCount < 20);
+  const lowCompetition = trending.filter(t => t.postCount < 5);
+  
+  // Nostr-specific insights
+  const insights = [
+    {
+      title: "Nostr is Different",
+      insight: "Unlike Twitter/Instagram, Nostr hashtags don't get 'drowned out' by volume. There's no algorithm suppressing you - everyone who follows a hashtag sees your post.",
+      recommendation: "Use popular hashtags freely - they help discoverability without penalty."
+    },
+    {
+      title: "Quality Over Quantity",  
+      insight: "Nostr users are savvy and engaged. Spammy hashtag stuffing stands out negatively.",
+      recommendation: "Use 2-4 relevant hashtags per post. More than 5 looks desperate."
+    },
+    {
+      title: "Community Hashtags Matter",
+      insight: "Tags like #grownostr, #plebchain, #coffeechain are community signals, not just discovery tools.",
+      recommendation: "Use community hashtags to show you're part of the tribe, not just broadcasting."
+    }
+  ];
+  
+  // Recommended mix based on current data
+  const recommendedMix = {
+    high: highCompetition.slice(0, 2).map(t => t.hashtag),
+    medium: mediumCompetition.slice(0, 3).map(t => t.hashtag),
+    niche: lowCompetition.slice(0, 2).map(t => t.hashtag),
+    explanation: "Mix 1 popular tag (reach) + 1-2 community tags (belonging) + 1 niche tag (targeted audience)"
+  };
+  
+  // Competition breakdown
+  const competitionBreakdown = {
+    high: {
+      count: highCompetition.length,
+      tags: highCompetition.slice(0, 5).map(t => t.hashtag),
+      advice: "Good for reach. Your post won't get buried - Nostr feeds are chronological."
+    },
+    medium: {
+      count: mediumCompetition.length,
+      tags: mediumCompetition.slice(0, 5).map(t => t.hashtag),
+      advice: "Sweet spot. Active enough to be seen, focused enough to find your people."
+    },
+    low: {
+      count: lowCompetition.length,
+      tags: lowCompetition.slice(0, 5).map(t => t.hashtag),
+      advice: "Niche territory. Great for targeting specific interests, but less discovery."
+    }
+  };
+  
+  return {
+    nostrAdvantage: "On Nostr, popular hashtags help you WITHOUT the drowning effect. No algorithm is hiding your posts.",
+    insights,
+    recommendedMix,
+    competitionBreakdown,
+    bottomLine: "Use 2-4 hashtags: 1 popular + 1-2 community + 1 topic-specific. Don't overthink it - Nostr rewards authenticity over SEO gaming."
+  };
 }
 
 /**
