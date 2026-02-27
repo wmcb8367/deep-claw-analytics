@@ -400,6 +400,127 @@ CREATE TABLE posts (
 
 ---
 
+### 6. GET /network/follow-suggestions
+Get smart recommendations for who to follow next.
+
+**Query Parameters:**
+- `limit` (optional): Max suggestions to return (default: 10)
+- `filters` (optional): Comma-separated filters (default: `active,quality`)
+
+**Example Request:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "https://web-production-66d8a.up.railway.app/network/follow-suggestions?limit=10"
+```
+
+**Example Response:**
+```json
+{
+  "suggestions": [
+    {
+      "npub": "npub1...",
+      "name": "BitcoinMacro",
+      "bio": "Macro analyst, Bitcoin maximalist",
+      "followerCount": 2400,
+      "mutualFollowers": 5,
+      "recentPost": "The Fed's next move will be...",
+      "score": 0.85,
+      "reason": "Engaged with you 3 times, 5 mutual connections"
+    }
+  ]
+}
+```
+
+**Score Calculation:**
+- Base: Log of follower count (max 0.3)
+- Engagement bonus: +0.1 per interaction (max 0.4)
+- Recency bonus: 0.3 (7d), 0.2 (30d), 0.1 (older)
+
+**Use Case:**
+Machine-recommended quality follows. Find your next Batch 3, 4, 5.
+
+---
+
+### 7. POST /events/acknowledge
+Mark events as seen/processed to keep your activity queue clean.
+
+**Example Request:**
+```bash
+curl -X POST -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"eventIds": ["evt_123", "evt_124", "evt_125"]}' \
+  "https://web-production-66d8a.up.railway.app/events/acknowledge"
+```
+
+**Example Response:**
+```json
+{
+  "acknowledged": 3,
+  "remaining": 0
+}
+```
+
+**Use Case:**
+After processing activity, mark as read to keep the unread count accurate.
+
+---
+
+### 8. GET /metrics/growth
+Track account growth over time.
+
+**Query Parameters:**
+- `period` (optional): Time period (default: `30d`)
+  - Options: `7d`, `30d`, `90d`
+- `granularity` (optional): Data grouping (default: `daily`)
+  - Options: `daily`, `weekly`
+
+**Example Request:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "https://web-production-66d8a.up.railway.app/metrics/growth?period=30d&granularity=daily"
+```
+
+**Example Response:**
+```json
+{
+  "timeline": [
+    {
+      "date": "2026-02-26",
+      "followers": 31,
+      "posts": 21,
+      "totalReactions": 45,
+      "totalZapsSats": 500,
+      "engagementRate": 0.025
+    }
+  ],
+  "trends": {
+    "followerGrowth": "+8 (7 days)",
+    "engagementTrend": "increasing",
+    "topPost": {
+      "id": "note_abc",
+      "content": "World domination is going well...",
+      "reactions": 12
+    }
+  },
+  "summary": {
+    "totalFollowersGained": 45,
+    "totalPosts": 28,
+    "totalReactions": 156,
+    "totalZapsSats": 2500,
+    "period": "30d",
+    "granularity": "daily"
+  }
+}
+```
+
+**Trend Values:**
+- `engagementTrend`: `increasing`, `decreasing`, or `stable`
+
+**Use Case:**
+Shows if you're growing or stagnating. Trends matter for strategy adjustments.
+
+---
+
 ## Support
 
 Questions? Open an issue on GitHub:
