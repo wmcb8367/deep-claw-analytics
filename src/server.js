@@ -13,6 +13,7 @@ const db = require('./db');
 const auth = require('./auth');
 const timingAnalytics = require('./timing-analytics');
 const networkScanner = require('./network-scanner');
+const agentApi = require('./agent-api');
 
 const app = express();
 
@@ -638,7 +639,45 @@ app.get('/metrics/timing/quick-scan', async (req, res) => {
   }
 });
 
+// ========================================
+// AGENT API ENDPOINTS
+// For AI agents managing Nostr accounts
+// ========================================
+
+/**
+ * GET /events/activity
+ * Get all new activity since last check (reactions, replies, mentions, zaps, follows)
+ */
+app.get('/events/activity', auth.authenticate, agentApi.getActivity);
+
+/**
+ * GET /posts/performance
+ * Get engagement metrics for recent posts
+ */
+app.get('/posts/performance', auth.authenticate, agentApi.getPostsPerformance);
+
+/**
+ * GET /insights/top-engagers
+ * Get users who consistently interact with your content
+ */
+app.get('/insights/top-engagers', auth.authenticate, agentApi.getTopEngagers);
+
+/**
+ * GET /insights/should-engage
+ * Smart recommendations for who to engage with
+ */
+app.get('/insights/should-engage', auth.authenticate, agentApi.getShouldEngage);
+
+/**
+ * GET /insights/posting-strategy
+ * When and what to post for optimal engagement
+ */
+app.get('/insights/posting-strategy', auth.authenticate, agentApi.getPostingStrategy);
+
+// ========================================
 // Error handler
+// ========================================
+
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   res.status(500).json({
