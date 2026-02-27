@@ -1,9 +1,168 @@
 /**
  * Hashtag Analytics
  * Analyze hashtag usage and performance for Nostr accounts
+ * Scans Nostr relays directly for real-time data
  */
 
 const db = require('./db');
+
+// WebSocket polyfill for Node.js
+const WebSocket = require('ws');
+if (!global.WebSocket) {
+  global.WebSocket = WebSocket;
+}
+
+// Relays to query
+const RELAYS = [
+  'wss://relay.damus.io',
+  'wss://nos.lol',
+  'wss://relay.nostr.band',
+  'wss://purplepag.es',
+  'wss://relay.snort.social',
+];
+
+/**
+ * Query a relay for events
+ */
+async function queryRelay(relayUrl, filter, timeoutMs = 10000) {
+  return new Promise((resolve) => {
+    const events = [];
+    let resolved = false;
+    
+    const ws = new WebSocket(relayUrl);
+    const subId = 'sub_' + Math.random().toString(36).slice(2);
+    
+    const cleanup = () => {
+      if (!resolved) {
+        resolved = true;
+        try { ws.close(); } catch (e) {}
+        resolve(events);
+      }
+    };
+    
+    const timeout = setTimeout(cleanup, timeoutMs);
+    
+    ws.on('open', () => {
+      ws.send(JSON.stringify(['REQ', subId, filter]));
+    });
+    
+    ws.on('message', (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg[0] === 'EVENT' && msg[1] === subId) {
+          events.push(msg[2]);
+        } else if (msg[0] === 'EOSE' && msg[1] === subId) {
+          clearTimeout(timeout);
+          cleanup();
+        }
+      } catch (e) {}
+    });
+    
+    ws.on('error', () => {
+      clearTimeout(timeout);
+      cleanup();
+    });
+    
+    ws.on('close', () => {
+      clearTimeout(timeout);
+      cleanup();
+    });
+  });
+}
+
+/**
+ * Convert npub to hex pubkey
+ */
+function npubToHex(npub) {
+  if (!npub || !npub.startsWith('npub1')) return npub;
+  
+  const ALPHABET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+  const data = npub.slice(5);
+  
+  const values = [];
+  for (const char of data) {
+    const idx = ALPHABET.indexOf(char);
+    if (idx === -1) throw new Error('Invalid npub');
+    values.push(idx);
+  }
+  
+  let bits = 0;
+  let value = 0;
+  const result = [];
+  
+  for (const v of values.slice(0, -6)) {
+    value = (value << 5) | v;
+    bits += 5;
+    while (bits >= 8) {
+      bits -= 8;
+      result.push((value >> bits) & 0xff);
+    }
+  }
+  
+  return result.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Fetch user's posts from Nostr relays
+ */
+async function fetchUserPosts(pubkeyHex, days = 90) {
+  const since = Math.floor(Date.now() / 1000) - (days * 24 * 60 * 60);
+  const allPosts = [];
+  
+  console.log(`[Hashtag] Fetching posts for ${pubkeyHex.slice(0, 8)}...`);
+  
+  for (const relay of RELAYS.slice(0, 3)) {
+    try {
+      const events = await queryRelay(relay, {
+        kinds: [1],
+        authors: [pubkeyHex],
+        since: since,
+        limit: 200
+      }, 8000);
+      
+      for (const event of events) {
+        if (!allPosts.find(p => p.id === event.id)) {
+          allPosts.push(event);
+        }
+      }
+      
+      if (allPosts.length > 0) {
+        console.log(`[Hashtag] Found ${allPosts.length} posts from ${relay}`);
+        break; // Got posts, no need to try more relays
+      }
+    } catch (e) {
+      console.log(`[Hashtag] ${relay} failed:`, e.message);
+    }
+  }
+  
+  return allPosts;
+}
+
+/**
+ * Fetch trending posts from Nostr for hashtag analysis
+ */
+async function fetchTrendingPosts(hours = 24) {
+  const since = Math.floor(Date.now() / 1000) - (hours * 60 * 60);
+  const allPosts = [];
+  
+  console.log(`[Hashtag] Fetching trending posts (last ${hours}h)...`);
+  
+  // Query relay.nostr.band - they have good global coverage
+  try {
+    const events = await queryRelay('wss://relay.nostr.band', {
+      kinds: [1],
+      since: since,
+      limit: 500
+    }, 15000);
+    
+    allPosts.push(...events);
+    console.log(`[Hashtag] Found ${allPosts.length} recent posts`);
+  } catch (e) {
+    console.log(`[Hashtag] Trending fetch failed:`, e.message);
+  }
+  
+  return allPosts;
+}
 
 /**
  * Extract hashtags from text
@@ -72,46 +231,56 @@ function extractTopics(text) {
 /**
  * GET /hashtags/personal
  * Analyze user's hashtag usage and performance
+ * Scans Nostr relays directly for real-time data
  */
 async function getPersonalHashtags(req, res) {
   try {
-    const userId = req.user.id;
-    const limit = parseInt(req.query.limit) || 50;
+    const npub = req.query.npub || req.user?.npub;
+    const days = parseInt(req.query.days) || 90;
     
-    // Get user's recent posts with hashtags
-    const postsQuery = `
-      SELECT 
-        p.note_id,
-        p.content,
-        p.posted_at,
-        p.reactions,
-        p.replies,
-        p.reposts,
-        p.impressions
-      FROM posts p
-      WHERE p.user_id = $1
-        AND p.posted_at >= NOW() - INTERVAL '90 days'
-      ORDER BY p.posted_at DESC
-      LIMIT $2
-    `;
+    if (!npub) {
+      return res.status(400).json({
+        error: 'Missing npub',
+        message: 'Provide npub query parameter'
+      });
+    }
     
-    const postsResult = await db.query(postsQuery, [userId, limit]);
+    const pubkeyHex = npubToHex(npub);
+    
+    // Fetch user's posts from Nostr relays
+    console.log(`[Hashtag] Scanning posts for ${npub.slice(0, 20)}...`);
+    const posts = await fetchUserPosts(pubkeyHex, days);
+    
+    if (posts.length === 0) {
+      return res.json({
+        overview: {
+          totalPosts: 0,
+          postsWithHashtags: 0,
+          postsWithoutHashtags: 0,
+          hashtagUsageRate: 0,
+          impact: 'neutral',
+          impactPercentage: 0
+        },
+        hashtagsUsed: [],
+        topTopics: [],
+        suggestions: [],
+        message: 'No posts found. Try posting some content first!'
+      });
+    }
     
     // Analyze hashtags and topics
     const hashtagStats = {};
     const topicCounts = {};
     let postsWithHashtags = 0;
     let postsWithoutHashtags = 0;
-    let totalEngagementWithHashtags = 0;
-    let totalEngagementWithoutHashtags = 0;
-    let impressionsWithHashtags = 0;
-    let impressionsWithoutHashtags = 0;
     
-    for (const post of postsResult.rows) {
-      const hashtags = extractHashtags(post.content);
-      const topics = extractTopics(post.content);
-      const engagement = (post.reactions || 0) + (post.replies || 0) + (post.reposts || 0);
-      const impressions = post.impressions || 0;
+    // We don't have engagement data from relays, so we'll track usage only
+    // In the future, we could query for reactions to each post
+    
+    for (const post of posts) {
+      const content = post.content || '';
+      const hashtags = extractHashtags(content);
+      const topics = extractTopics(content);
       
       // Track topics
       for (const topic of topics) {
@@ -120,65 +289,48 @@ async function getPersonalHashtags(req, res) {
       
       if (hashtags.length > 0) {
         postsWithHashtags++;
-        totalEngagementWithHashtags += engagement;
-        impressionsWithHashtags += impressions;
         
-        // Track each hashtag's performance
+        // Track each hashtag's usage
         for (const tag of hashtags) {
           if (!hashtagStats[tag]) {
             hashtagStats[tag] = {
               count: 0,
-              totalEngagement: 0,
-              totalImpressions: 0,
-              posts: []
+              posts: [],
+              firstUsed: post.created_at,
+              lastUsed: post.created_at
             };
           }
           
           hashtagStats[tag].count++;
-          hashtagStats[tag].totalEngagement += engagement;
-          hashtagStats[tag].totalImpressions += impressions;
           hashtagStats[tag].posts.push({
-            noteId: post.note_id,
-            engagement,
-            impressions,
-            postedAt: post.posted_at
+            noteId: post.id,
+            content: content.slice(0, 100),
+            postedAt: new Date(post.created_at * 1000).toISOString()
           });
+          
+          // Track first/last used
+          if (post.created_at < hashtagStats[tag].firstUsed) {
+            hashtagStats[tag].firstUsed = post.created_at;
+          }
+          if (post.created_at > hashtagStats[tag].lastUsed) {
+            hashtagStats[tag].lastUsed = post.created_at;
+          }
         }
       } else {
         postsWithoutHashtags++;
-        totalEngagementWithoutHashtags += engagement;
-        impressionsWithoutHashtags += impressions;
       }
     }
     
-    // Calculate averages
-    const avgEngagementWithHashtags = postsWithHashtags > 0 
-      ? totalEngagementWithHashtags / postsWithHashtags 
-      : 0;
-    const avgEngagementWithoutHashtags = postsWithoutHashtags > 0
-      ? totalEngagementWithoutHashtags / postsWithoutHashtags
-      : 0;
-    const avgEngagementRateWithHashtags = impressionsWithHashtags > 0
-      ? totalEngagementWithHashtags / impressionsWithHashtags
-      : 0;
-    const avgEngagementRateWithoutHashtags = impressionsWithoutHashtags > 0
-      ? totalEngagementWithoutHashtags / impressionsWithoutHashtags
-      : 0;
-    
     // Format hashtag stats
-    const hashtagsUsed = Object.entries(hashtagStats).map(([tag, stats]) => ({
-      hashtag: tag,
-      timesUsed: stats.count,
-      avgEngagement: stats.totalEngagement / stats.count,
-      avgEngagementRate: stats.totalImpressions > 0 
-        ? stats.totalEngagement / stats.totalImpressions
-        : 0,
-      totalImpressions: stats.totalImpressions,
-      lastUsed: stats.posts[0].postedAt,
-      performance: stats.totalEngagement / stats.count > avgEngagementWithHashtags 
-        ? 'above_average' 
-        : 'below_average'
-    })).sort((a, b) => b.avgEngagement - a.avgEngagement);
+    const hashtagsUsed = Object.entries(hashtagStats)
+      .map(([tag, stats]) => ({
+        hashtag: tag,
+        timesUsed: stats.count,
+        firstUsed: new Date(stats.firstUsed * 1000).toISOString(),
+        lastUsed: new Date(stats.lastUsed * 1000).toISOString(),
+        recentPosts: stats.posts.slice(0, 3) // Last 3 posts with this hashtag
+      }))
+      .sort((a, b) => b.timesUsed - a.timesUsed);
     
     // Get top topics
     const topTopics = Object.entries(topicCounts)
@@ -189,30 +341,31 @@ async function getPersonalHashtags(req, res) {
     // Generate suggestions based on topics
     const suggestions = await generateHashtagSuggestions(topTopics, hashtagsUsed);
     
+    const hashtagUsageRate = posts.length > 0 
+      ? postsWithHashtags / posts.length 
+      : 0;
+    
     res.json({
       overview: {
-        totalPosts: postsResult.rows.length,
+        totalPosts: posts.length,
         postsWithHashtags,
         postsWithoutHashtags,
-        hashtagUsageRate: postsResult.rows.length > 0 
-          ? postsWithHashtags / postsResult.rows.length 
-          : 0,
-        avgEngagementWithHashtags,
-        avgEngagementWithoutHashtags,
-        avgEngagementRateWithHashtags,
-        avgEngagementRateWithoutHashtags,
-        impact: avgEngagementWithHashtags > avgEngagementWithoutHashtags 
-          ? 'positive' 
-          : avgEngagementWithHashtags < avgEngagementWithoutHashtags 
-          ? 'negative' 
-          : 'neutral',
-        impactPercentage: avgEngagementWithoutHashtags > 0
-          ? Math.round(((avgEngagementWithHashtags - avgEngagementWithoutHashtags) / avgEngagementWithoutHashtags) * 100)
-          : 0
+        hashtagUsageRate,
+        uniqueHashtagsUsed: hashtagsUsed.length,
+        // Without engagement data, we can't calculate impact
+        // But we can give recommendations based on usage
+        impact: hashtagUsageRate > 0.5 ? 'active' : hashtagUsageRate > 0.2 ? 'moderate' : 'low',
+        recommendation: hashtagUsageRate < 0.3 
+          ? 'Try using more hashtags to increase discoverability'
+          : hashtagUsageRate > 0.8
+          ? 'Good hashtag usage! Consider varying your hashtags'
+          : 'Balanced hashtag usage'
       },
-      hashtagsUsed: hashtagsUsed.slice(0, 20), // Top 20
+      hashtagsUsed: hashtagsUsed.slice(0, 20),
       topTopics,
-      suggestions
+      suggestions,
+      scannedPeriod: `${days} days`,
+      scannedAt: new Date().toISOString()
     });
     
   } catch (error) {
@@ -228,73 +381,120 @@ async function getPersonalHashtags(req, res) {
  * Generate hashtag suggestions based on user's topics
  */
 async function generateHashtagSuggestions(topTopics, hashtagsUsed) {
-  // Map common topics to relevant hashtags
+  // Comprehensive topic to hashtag mapping
   const topicHashtagMap = {
-    'bitcoin': ['bitcoin', 'btc', 'crypto'],
-    'nostr': ['nostr', 'grownostr', 'plebchain'],
-    'lightning': ['lightning', 'ln', 'zaps'],
-    'freedom': ['freedom', 'liberty', 'sovereignty'],
-    'building': ['buidl', 'building', 'dev'],
+    // Crypto & Bitcoin
+    'bitcoin': ['bitcoin', 'btc', 'hodl', 'satoshi'],
+    'crypto': ['crypto', 'cryptocurrency', 'web3'],
+    'lightning': ['lightning', 'ln', 'zaps', 'lnurl'],
+    'sats': ['sats', 'stackingsats', 'satoshi'],
+    'money': ['bitcoin', 'soundmoney', 'inflation'],
+    
+    // Nostr & Social
+    'nostr': ['nostr', 'grownostr', 'nostrich'],
+    'social': ['plebchain', 'nostrcommunity'],
+    'follow': ['followfriday', 'introductions'],
+    
+    // Tech & Dev
+    'building': ['buidl', 'building', 'opensource'],
+    'code': ['dev', 'programming', 'code'],
     'tech': ['tech', 'technology', 'innovation'],
-    'news': ['news', 'breaking', 'current'],
-    'meme': ['meme', 'memes', 'funny'],
-    'art': ['art', 'artist', 'artstr'],
+    'rust': ['rustlang', 'rust', 'programming'],
+    'python': ['python', 'programming'],
+    
+    // Content types
+    'meme': ['meme', 'memes', 'humor', 'funny'],
+    'art': ['art', 'artstr', 'artist', 'creative'],
     'music': ['music', 'tunestr', 'musician'],
+    'photo': ['photography', 'photostr', 'photo'],
     'food': ['foodstr', 'cooking', 'food'],
-    'photography': ['photography', 'photostr', 'photo']
+    'travel': ['travel', 'travelstr', 'adventure'],
+    
+    // Community
+    'coffee': ['coffeechain', 'coffee', 'gm'],
+    'morning': ['gm', 'goodmorning', 'coffeechain'],
+    'freedom': ['freedom', 'liberty', 'sovereignty'],
+    'news': ['news', 'current', 'breaking'],
+    
+    // AI
+    'ai': ['ai', 'artificialintelligence', 'machinelearning'],
+    'agent': ['aiagent', 'autonomousai'],
+    'lobster': ['lobster', 'spacelobster'] // For Deep Claw :)
   };
   
   const usedHashtags = new Set(hashtagsUsed.map(h => h.hashtag));
   const suggestions = [];
+  const suggestedSet = new Set();
   
+  // First, suggest based on content topics
   for (const { topic } of topTopics) {
-    // Direct mapping
+    // Check direct topic match
     if (topicHashtagMap[topic]) {
       for (const tag of topicHashtagMap[topic]) {
-        if (!usedHashtags.has(tag)) {
+        if (!usedHashtags.has(tag) && !suggestedSet.has(tag)) {
+          suggestedSet.add(tag);
           suggestions.push({
             hashtag: tag,
-            reason: `Related to your topic: ${topic}`,
-            confidence: 'high'
+            reason: `Matches your topic: "${topic}"`,
+            confidence: 'high',
+            category: 'topic_match'
           });
         }
       }
     }
     
-    // Topic itself as hashtag
-    if (!usedHashtags.has(topic) && topic.length >= 4) {
-      suggestions.push({
-        hashtag: topic,
-        reason: `Direct topic from your content`,
-        confidence: 'medium'
-      });
+    // Check partial matches
+    for (const [key, tags] of Object.entries(topicHashtagMap)) {
+      if (topic.includes(key) || key.includes(topic)) {
+        for (const tag of tags) {
+          if (!usedHashtags.has(tag) && !suggestedSet.has(tag)) {
+            suggestedSet.add(tag);
+            suggestions.push({
+              hashtag: tag,
+              reason: `Related to "${topic}"`,
+              confidence: 'medium',
+              category: 'related'
+            });
+          }
+        }
+      }
     }
   }
   
-  // Add common Nostr hashtags if not used
-  const commonNostrTags = [
-    { tag: 'grownostr', reason: 'Popular community hashtag' },
-    { tag: 'plebchain', reason: 'Engaged Nostr community' },
-    { tag: 'coffeechain', reason: 'Popular social hashtag' },
-    { tag: 'asknostr', reason: 'For questions and discussions' }
+  // Essential Nostr hashtags for growth
+  const essentialTags = [
+    { tag: 'grownostr', reason: '🚀 Essential for growth - active community', confidence: 'high' },
+    { tag: 'plebchain', reason: '⚡ Engaged Bitcoin/Nostr community', confidence: 'high' },
+    { tag: 'introductions', reason: '👋 Great for new followers', confidence: 'medium' },
+    { tag: 'asknostr', reason: '❓ For questions - high engagement', confidence: 'medium' },
+    { tag: 'zapathon', reason: '⚡ For zap-worthy content', confidence: 'medium' },
+    { tag: 'coffeechain', reason: '☕ Morning posts, social vibes', confidence: 'medium' },
+    { tag: 'nostr', reason: '📢 Core Nostr hashtag', confidence: 'high' }
   ];
   
-  for (const { tag, reason } of commonNostrTags) {
-    if (!usedHashtags.has(tag) && suggestions.length < 10) {
+  for (const { tag, reason, confidence } of essentialTags) {
+    if (!usedHashtags.has(tag) && !suggestedSet.has(tag) && suggestions.length < 15) {
+      suggestedSet.add(tag);
       suggestions.push({
         hashtag: tag,
         reason,
-        confidence: 'medium'
+        confidence,
+        category: 'essential'
       });
     }
   }
   
-  return suggestions.slice(0, 10);
+  // Sort by confidence and limit
+  const confidenceOrder = { high: 3, medium: 2, low: 1 };
+  suggestions.sort((a, b) => confidenceOrder[b.confidence] - confidenceOrder[a.confidence]);
+  
+  return suggestions.slice(0, 12);
 }
 
 /**
  * GET /hashtags/trending
  * Get trending hashtags on Nostr
+ * Scans relays directly for real-time trending data
  */
 async function getTrendingHashtags(req, res) {
   try {
@@ -309,56 +509,75 @@ async function getTrendingHashtags(req, res) {
     };
     const hours = periodHours[period] || 24;
     
-    // Query global hashtag usage from posts
-    // This assumes we're tracking global posts or have a global_posts table
-    const query = `
-      WITH hashtag_usage AS (
-        SELECT 
-          unnest(regexp_matches(content, '#(\\w+)', 'g')) as hashtag,
-          note_id,
-          posted_at,
-          (reactions + replies + reposts) as engagement,
-          impressions
-        FROM posts
-        WHERE posted_at >= NOW() - INTERVAL '${hours} hours'
-      )
-      SELECT 
-        lower(hashtag) as hashtag,
-        COUNT(DISTINCT note_id) as post_count,
-        COUNT(DISTINCT note_id) FILTER (WHERE posted_at >= NOW() - INTERVAL '24 hours') as recent_posts,
-        SUM(engagement) as total_engagement,
-        AVG(engagement) as avg_engagement,
-        SUM(impressions) as total_impressions,
-        MAX(posted_at) as last_used
-      FROM hashtag_usage
-      GROUP BY lower(hashtag)
-      HAVING COUNT(DISTINCT note_id) >= 3
-      ORDER BY post_count DESC, total_engagement DESC
-      LIMIT $1
-    `;
+    // Fetch posts from Nostr relays
+    console.log(`[Hashtag] Fetching trending posts (${period})...`);
+    const posts = await fetchTrendingPosts(hours);
     
-    const result = await db.query(query, [limit]);
+    if (posts.length === 0) {
+      return res.json({
+        period,
+        trending: [],
+        totalHashtags: 0,
+        message: 'Could not fetch trending posts from relays'
+      });
+    }
     
-    const trending = result.rows.map(row => ({
-      hashtag: row.hashtag,
-      postCount: parseInt(row.post_count) || 0,
-      recentPosts: parseInt(row.recent_posts) || 0,
-      totalEngagement: parseInt(row.total_engagement) || 0,
-      avgEngagement: parseFloat(row.avg_engagement) || 0,
-      totalImpressions: parseInt(row.total_impressions) || 0,
-      engagementRate: row.total_impressions > 0 
-        ? parseFloat(row.total_engagement) / parseFloat(row.total_impressions)
-        : 0,
-      lastUsed: row.last_used,
-      trend: parseInt(row.recent_posts) > parseInt(row.post_count) / (hours / 24) 
-        ? 'rising' 
-        : 'stable'
-    }));
+    // Extract and count hashtags
+    const hashtagCounts = {};
+    const hashtagPosts = {};
+    
+    for (const post of posts) {
+      const content = post.content || '';
+      const hashtags = extractHashtags(content);
+      
+      for (const tag of hashtags) {
+        if (!hashtagCounts[tag]) {
+          hashtagCounts[tag] = 0;
+          hashtagPosts[tag] = [];
+        }
+        hashtagCounts[tag]++;
+        hashtagPosts[tag].push({
+          id: post.id,
+          created_at: post.created_at,
+          content: content.slice(0, 100)
+        });
+      }
+    }
+    
+    // Sort by count and format
+    const trending = Object.entries(hashtagCounts)
+      .filter(([tag, count]) => count >= 2) // At least 2 uses
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, limit)
+      .map(([tag, count], index) => {
+        const tagPosts = hashtagPosts[tag] || [];
+        const recentPosts = tagPosts.filter(p => 
+          p.created_at > (Date.now() / 1000) - (24 * 60 * 60)
+        ).length;
+        
+        return {
+          rank: index + 1,
+          hashtag: tag,
+          postCount: count,
+          recentPosts,
+          samplePosts: tagPosts.slice(0, 3).map(p => ({
+            content: p.content,
+            postedAt: new Date(p.created_at * 1000).toISOString()
+          })),
+          trend: recentPosts > count * 0.5 ? 'rising' : 'stable'
+        };
+      });
+    
+    // Categorize trending hashtags
+    const categories = categorizeTrendingHashtags(trending);
     
     res.json({
       period,
+      totalPostsScanned: posts.length,
+      totalUniqueHashtags: Object.keys(hashtagCounts).length,
       trending,
-      totalHashtags: result.rows.length
+      categories,
+      scannedAt: new Date().toISOString()
     });
     
   } catch (error) {
@@ -371,30 +590,76 @@ async function getTrendingHashtags(req, res) {
 }
 
 /**
+ * Categorize trending hashtags into topics
+ */
+function categorizeTrendingHashtags(trending) {
+  const categories = {
+    crypto: [],
+    nostr: [],
+    tech: [],
+    community: [],
+    other: []
+  };
+  
+  const categoryPatterns = {
+    crypto: ['bitcoin', 'btc', 'crypto', 'lightning', 'ln', 'sats', 'zaps', 'hodl', 'defi', 'eth'],
+    nostr: ['nostr', 'grownostr', 'plebchain', 'zapathon', 'nostrich', 'damus', 'primal', 'snort'],
+    tech: ['dev', 'code', 'programming', 'rust', 'python', 'ai', 'tech', 'build', 'buidl'],
+    community: ['coffeechain', 'foodstr', 'artstr', 'photostr', 'asknostr', 'introduction', 'gm']
+  };
+  
+  for (const tag of trending) {
+    let categorized = false;
+    
+    for (const [category, patterns] of Object.entries(categoryPatterns)) {
+      if (patterns.some(p => tag.hashtag.includes(p))) {
+        categories[category].push(tag.hashtag);
+        categorized = true;
+        break;
+      }
+    }
+    
+    if (!categorized) {
+      categories.other.push(tag.hashtag);
+    }
+  }
+  
+  return categories;
+}
+
+/**
  * GET /hashtags/recommendations
  * Get personalized hashtag recommendations
+ * Combines personal analysis with trending data
  */
 async function getHashtagRecommendations(req, res) {
   try {
-    const userId = req.user.id;
+    const npub = req.query.npub || req.user?.npub;
     
-    // Get user's personal hashtag data
-    const personalQuery = `
-      SELECT content
-      FROM posts
-      WHERE user_id = $1
-        AND posted_at >= NOW() - INTERVAL '30 days'
-      ORDER BY posted_at DESC
-      LIMIT 50
-    `;
+    if (!npub) {
+      return res.status(400).json({
+        error: 'Missing npub',
+        message: 'Provide npub query parameter'
+      });
+    }
     
-    const personalResult = await db.query(personalQuery, [userId]);
+    const pubkeyHex = npubToHex(npub);
     
-    // Extract topics from recent posts
+    // Fetch user's posts
+    console.log(`[Hashtag] Getting recommendations for ${npub.slice(0, 20)}...`);
+    const posts = await fetchUserPosts(pubkeyHex, 30);
+    
+    // Extract topics and used hashtags
     const allTopics = [];
-    for (const post of personalResult.rows) {
-      const topics = extractTopics(post.content);
+    const usedHashtags = new Set();
+    
+    for (const post of posts) {
+      const content = post.content || '';
+      const topics = extractTopics(content);
+      const hashtags = extractHashtags(content);
+      
       allTopics.push(...topics);
+      hashtags.forEach(tag => usedHashtags.add(tag));
     }
     
     // Count topic frequency
@@ -408,75 +673,88 @@ async function getHashtagRecommendations(req, res) {
       .slice(0, 5)
       .map(([topic, count]) => ({ topic, count }));
     
-    // Get hashtags user has used
-    const usedHashtags = new Set();
-    for (const post of personalResult.rows) {
-      const hashtags = extractHashtags(post.content);
-      hashtags.forEach(tag => usedHashtags.add(tag));
+    // Fetch trending for comparison
+    const trendingPosts = await fetchTrendingPosts(24);
+    const trendingHashtags = {};
+    
+    for (const post of trendingPosts) {
+      const hashtags = extractHashtags(post.content || '');
+      for (const tag of hashtags) {
+        trendingHashtags[tag] = (trendingHashtags[tag] || 0) + 1;
+      }
     }
     
-    // Get trending hashtags
-    const trendingQuery = `
-      WITH hashtag_usage AS (
-        SELECT 
-          unnest(regexp_matches(content, '#(\\w+)', 'g')) as hashtag,
-          (reactions + replies + reposts) as engagement
-        FROM posts
-        WHERE posted_at >= NOW() - INTERVAL '7 days'
-      )
-      SELECT 
-        lower(hashtag) as hashtag,
-        COUNT(*) as usage_count,
-        AVG(engagement) as avg_engagement
-      FROM hashtag_usage
-      GROUP BY lower(hashtag)
-      HAVING COUNT(*) >= 5
-      ORDER BY avg_engagement DESC
-      LIMIT 20
-    `;
-    
-    const trendingResult = await db.query(trendingQuery);
-    
     const recommendations = [];
+    const suggestedSet = new Set();
     
-    // Add topic-based recommendations
+    // Topic-based recommendations
+    const topicHashtagMap = {
+      'bitcoin': ['bitcoin', 'btc', 'hodl'],
+      'nostr': ['nostr', 'grownostr', 'plebchain'],
+      'lightning': ['lightning', 'zaps', 'ln'],
+      'tech': ['tech', 'dev', 'buidl'],
+      'ai': ['ai', 'artificialintelligence'],
+      'freedom': ['freedom', 'liberty'],
+      'meme': ['meme', 'memes', 'humor']
+    };
+    
     for (const { topic } of topTopics) {
-      if (!usedHashtags.has(topic)) {
+      if (topicHashtagMap[topic]) {
+        for (const tag of topicHashtagMap[topic]) {
+          if (!usedHashtags.has(tag) && !suggestedSet.has(tag)) {
+            suggestedSet.add(tag);
+            recommendations.push({
+              hashtag: tag,
+              reason: `Matches your topic: "${topic}"`,
+              type: 'topic_based',
+              priority: 'high'
+            });
+          }
+        }
+      }
+    }
+    
+    // Trending hashtags user hasn't tried
+    const sortedTrending = Object.entries(trendingHashtags)
+      .filter(([tag]) => !usedHashtags.has(tag) && !suggestedSet.has(tag))
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10);
+    
+    for (const [tag, count] of sortedTrending) {
+      suggestedSet.add(tag);
+      recommendations.push({
+        hashtag: tag,
+        reason: `Trending now (${count} recent uses)`,
+        type: 'trending',
+        priority: 'medium',
+        trendingCount: count
+      });
+    }
+    
+    // Essential Nostr hashtags
+    const essentials = ['grownostr', 'plebchain', 'nostr', 'zapathon'];
+    for (const tag of essentials) {
+      if (!usedHashtags.has(tag) && !suggestedSet.has(tag)) {
+        suggestedSet.add(tag);
         recommendations.push({
-          hashtag: topic,
-          reason: `Matches your content topic`,
-          type: 'topic_based',
+          hashtag: tag,
+          reason: 'Essential Nostr community hashtag',
+          type: 'essential',
           priority: 'high'
         });
       }
     }
     
-    // Add trending hashtags user hasn't used
-    for (const row of trendingResult.rows) {
-      const tag = row.hashtag;
-      if (!usedHashtags.has(tag)) {
-        recommendations.push({
-          hashtag: tag,
-          reason: `Trending with ${Math.round(row.avg_engagement)} avg engagement`,
-          type: 'trending',
-          priority: 'medium',
-          avgEngagement: parseFloat(row.avg_engagement) || 0
-        });
-      }
-    }
-    
-    // Deduplicate and limit
-    const uniqueRecs = [];
-    const seen = new Set();
-    for (const rec of recommendations) {
-      if (!seen.has(rec.hashtag)) {
-        seen.add(rec.hashtag);
-        uniqueRecs.push(rec);
-      }
-    }
+    // Sort by priority
+    const priorityOrder = { high: 3, medium: 2, low: 1 };
+    recommendations.sort((a, b) => priorityOrder[b.priority] - priorityOrder[a.priority]);
     
     res.json({
-      recommendations: uniqueRecs.slice(0, 15)
+      recommendations: recommendations.slice(0, 15),
+      yourTopics: topTopics,
+      hashtagsYouUse: Array.from(usedHashtags).slice(0, 10),
+      postsAnalyzed: posts.length,
+      scannedAt: new Date().toISOString()
     });
     
   } catch (error) {
